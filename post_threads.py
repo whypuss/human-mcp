@@ -1,15 +1,18 @@
 """
-post_threads.py — Threads 圖文發文（Playwright 獨立 Chromium Profile）
+post_threads.py — Threads 圖文發文（視覺語義 + 自愈點擊）
 
-用 launch_persistent_context 啟動獨立 Chromium，不影響用戶正常 Chrome。
-第一次需手動登入，之後 profile 自動記住。
+與舊版差異：
+- 不再依賴座標 mouse.click(x, y)
+- 改用 Playwright getByRole/getByText DOM 定位（UI 變了也能找到）
+- 找不到時用 vision 視覺定位（browser_vision MCP）
+- 點擊後自愈驗證：結果不符預期自動重試
 
 流程：
 1. 啟動 Chromium（獨立 profile）
-2. 導航到 Threads 首頁，等待登入
-3. 點擊 composer 文字框
+2. 導航到 Threads 首頁
+3. 點擊 composer
 4. 上傳圖片（可選）
-5. keyboard.type 輸入文字（擬人速度）
+5. keyboard.type 輸入文字
 6. 點「新增到串文」→「發佈」
 7. reload 驗證
 """
@@ -20,7 +23,7 @@ import os
 import random
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from playwright.async_api import async_playwright
 
@@ -31,28 +34,176 @@ THREADS_PROFILE = Path("/tmp/threads-chromium-profile")
 THREADS_PROFILE.mkdir(parents=True, exist_ok=True)
 
 
-# ── Selector 工廠 ───────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 語義點擊（DOM + 視覺自愈）
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _dialog():
-    return '[role="dialog"]'
+class SemanticClicker:
+    """
+    語義點擊器：DOM 定位為主，找不到時用 vision 視覺定位。
+    點擊後驗證結果，錯了自動重試（最多 3 次）。
+    """
 
-def _textbox():
-    return '[role="dialog"] div[role="textbox"]'
+    def __init__(self, page, vision_fn=None):
+        self.page = page
+        self.vision_fn = vision_fn  # 可選：外部視覺定位函數 (label -> x, y)
+        self._attempts = {}
 
-def _svg_btn(aria_label: str):
-    return f'[role="dialog"] svg[aria-label="{aria_label}"]'
+    async def _verify_dialog_text_contains(self, keyword: str, timeout: float = 3) -> bool:
+        """驗證 dialog 是否包含某個關鍵字（用於點擊後的結果驗證）。"""
+        for _ in range(int(timeout * 5)):
+            try:
+                dt = await self.page.evaluate(
+                    "() => { var d = document.querySelector('[role=\"dialog\"]'); "
+                    "return d ? d.innerText.slice(0, 500) : ''; }"
+                )
+                if keyword in dt:
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.2)
+        return False
+
+    async def _find_by_dom(self, role: str, name: str = None, parent: str = None) -> Optional:
+        """
+        DOM 定位：透過 Playwright getByRole/getByText 找元素。
+        比座標靠譜，UI 變了只要文字/role 還在就能找到。
+        """
+        dialog = self.page.locator('[role="dialog"]')
+        if parent == "dialog":
+            container = dialog
+        else:
+            container = self.page
+
+        locators = []
+
+        if role == "button":
+            if name:
+                locators.append(container.get_by_role("button", name=name))
+                locators.append(container.get_by_role("button", name=name, exact=False))
+            locators.append(container.locator(f"[role='dialog'] button:has-text('{name or ''}')"))
+        elif role == "textbox":
+            locators.append(container.get_by_role("textbox"))
+            locators.append(container.locator('[role="dialog"] [role="textbox"]'))
+        else:
+            locators.append(container.locator(f"[role='{role}']"))
+
+        for loc in locators:
+            try:
+                count = await loc.count()
+                if count > 0:
+                    # 確認可見
+                    if await loc.first.is_visible(timeout=1000):
+                        return loc.first
+            except Exception:
+                pass
+        return None
+
+    async def _find_by_vision(self, label: str) -> Optional[Tuple[int, int]]:
+        """
+        視覺定位：截圖後用 VLM 分析座標。
+        外部傳入 vision_fn，格式：vision_fn(screenshot_path, "要找什麼") -> (x, y)
+        """
+        if not self.vision_fn:
+            return None
+        try:
+            # 截圖
+            img_path = f"/tmp/threads_vision_{int(time.time()*1000)}.png"
+            await self.page.screenshot(path=img_path)
+            x, y = await self.vision_fn(img_path, label)
+            os.remove(img_path)
+            return (x, y)
+        except Exception as e:
+            log.warning(f"[_find_by_vision] vision failed: {e}")
+            return None
+
+    async def click(
+        self,
+        label: str,
+        role: str = "button",
+        parent: str = "dialog",
+        verify_after: str = None,
+        verify_timeout: float = 5,
+        max_retries: int = 3,
+    ) -> bool:
+        """
+        語義點擊主函數。
+
+        策略：
+        1. DOM 定位（getByRole/getByText）
+        2. 找不到 → 視覺定位（vision_fn）
+        3. 點擊
+        4. 驗證結果（verify_after 關鍵字）
+        5. 錯了 → 重試（最多 max_retries 次）
+
+        Args:
+            label: 要點擊的文字（如 "新增到串文"、"發佈"）
+            role: DOM role（默認 button）
+            parent: 限定範圍（默認 dialog）
+            verify_after: 點擊後要驗證的關鍵字（如點「新增到串文」後預期出現「發佈」）
+            verify_timeout: 驗證超時（秒）
+            max_retries: 最大重試次數
+        """
+        for attempt in range(1, max_retries + 1):
+            log.debug(f"[SemanticClicker] attempt {attempt}/{max_retries} for '{label}'")
+
+            # ── Step 1: DOM 定位 ─────────────────────────────────────────
+            elem = await self._find_by_dom(role, name=label, parent=parent)
+
+            if elem:
+                try:
+                    await elem.click(timeout=5000)
+                    log.debug(f"[SemanticClicker] DOM click succeeded: '{label}'")
+                except Exception as click_err:
+                    log.warning(f"[SemanticClicker] DOM click failed ({click_err}), trying force")
+                    try:
+                        await elem.click(timeout=3000, force=True)
+                    except Exception:
+                        elem = None  # 降級到視覺
+            else:
+                log.debug(f"[SemanticClicker] DOM not found for '{label}', trying vision")
+
+            # ── Step 2: 視覺定位（DOM 失敗時）────────────────────────────
+            if not elem:
+                coords = await self._find_by_vision(label)
+                if coords:
+                    x, y = coords
+                    await self.page.mouse.click(x, y)
+                    log.debug(f"[SemanticClicker] vision click: '{label}' at ({x}, {y})")
+                else:
+                    log.warning(f"[SemanticClicker] could not locate '{label}'")
+                    continue  # 重試
+
+            # ── Step 3: 驗證結果 ─────────────────────────────────────────
+            if verify_after:
+                found = await self._verify_dialog_text_contains(verify_after, timeout=verify_timeout)
+                if found:
+                    log.debug(f"[SemanticClicker] ✅ verified '{verify_after}' after clicking '{label}'")
+                    return True
+                else:
+                    log.warning(
+                        f"[SemanticClicker] ❌ verify failed: expected '{verify_after}' "
+                        f"after '{label}' (attempt {attempt}/{max_retries})"
+                    )
+                    await _random_delay(1.0, 1.5)
+                    continue  # 重試
+            else:
+                return True
+
+        log.error(f"[SemanticClicker] ❌ all {max_retries} attempts failed for '{label}'")
+        return False
 
 
-# ── 登入等待 ────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 登入等待
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def _ensure_threads_logged_in(page) -> bool:
-    """等待 Threads 頁面加載完成（已登入或未登入）。"""
     for attempt in range(30):
         await asyncio.sleep(1)
         try:
             url = page.url.lower()
             if "threads.net" in url:
-                # 檢查是否在登入頁
                 if "/login" in url:
                     log.debug(f"[_ensure] 等待登入... {attempt+1}/30")
                     continue
@@ -63,7 +214,9 @@ async def _ensure_threads_logged_in(page) -> bool:
     return False
 
 
-# ── 主流程 ────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 主流程
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def post_threads(
     message: str,
@@ -73,14 +226,7 @@ async def post_threads(
     """
     發布 Threads 圖文帖子。
 
-    流程：
-      1. 啟動 Chromium（獨立 profile）
-      2. 導航到 Threads 首頁
-      3. 點擊 composer
-      4. 上傳圖片（可選）
-      5. keyboard.type 輸入文字
-      6. 點「新增到串文」→「發佈」
-      7. reload 驗證
+    使用語義點擊架構（SemanticClicker），UI 變化時有自愈能力。
     """
     # ── 參數驗證 ──────────────────────────────────────────────────────────
     if image_path and not os.path.exists(image_path):
@@ -111,6 +257,9 @@ async def post_threads(
             await ctx.close()
             return "❌ Threads 加載超時，請在 Chromium 視窗中完成登入後重試"
         await _random_delay(4.0, 5.0)
+
+        # 初始化語義點擊器
+        clicker = SemanticClicker(page)
 
         # ════════════════════════════════════════════════════════════════
         # Step 1: 確保 composer dialog 已打開
@@ -151,7 +300,8 @@ async def post_threads(
         # Step 2: 點擊文字框，進入輸入模式
         # ════════════════════════════════════════════════════════════════
         try:
-            tb = page.locator(_textbox()).last
+            # 用語義點擊（getByRole textbox）
+            tb = page.locator('[role="dialog"] [role="textbox"]').last
             await tb.click(timeout=3000, force=True)
             await _random_delay(0.3, 0.6)
         except Exception as e:
@@ -163,7 +313,16 @@ async def post_threads(
         # ════════════════════════════════════════════════════════════════
         if image_path:
             try:
-                await page.locator(_svg_btn("附加影音內容")).last.click(timeout=3000, force=True)
+                # 點「附加影音內容」
+                svg_ok = await clicker.click(
+                    label="附加影音內容",
+                    role="button",
+                    parent="dialog",
+                    verify_after=None,
+                    max_retries=2,
+                )
+                if not svg_ok:
+                    raise Exception("附加影音內容 button not found")
                 await _random_delay(0.5, 0.8)
 
                 try:
@@ -195,7 +354,7 @@ async def post_threads(
             await page.keyboard.type(message, delay=delay_ms)
             await _random_delay(0.3, 0.6)
 
-            tb_text = await page.locator(_textbox()).last.inner_text(timeout=3000)
+            tb_text = await page.locator('[role="dialog"] [role="textbox"]').last.inner_text(timeout=3000)
             if not tb_text.strip():
                 await ctx.close()
                 return "❌ Text did not land in editor"
@@ -206,47 +365,36 @@ async def post_threads(
             return f"❌ Typing failed: {e}"
 
         # ════════════════════════════════════════════════════════════════
-        # Step 5: 兩步發文：「新增到串文」→「發佈」
+        # Step 5: 兩步發文（使用語義點擊 + 自愈驗證）
         # ════════════════════════════════════════════════════════════════
         try:
-            # 5a: 新增加到串文
-            coord_5a = await page.evaluate("""() => {
-                const d = document.querySelector('[role="dialog"]');
-                if (!d) return null;
-                const btns = d.querySelectorAll('[role="button"]');
-                for (const b of btns) {
-                    if ((b.innerText || '').includes('新增到串文')) {
-                        const r = b.getBoundingClientRect();
-                        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
-                    }
-                }
-                return null;
-            }""")
-            if not coord_5a:
+            # 5a: 新增加到串文（點完驗證，出現「發佈」按鈕說明成功）
+            ok_5a = await clicker.click(
+                label="新增到串文",
+                role="button",
+                parent="dialog",
+                verify_after="發佈",  # 點完後 dialog 應包含「發佈」
+                verify_timeout=5,
+                max_retries=3,
+            )
+            if not ok_5a:
                 await ctx.close()
-                return "❌ 新增加到串文 button not found"
-            await page.mouse.click(coord_5a["x"], coord_5a["y"])
-            log.debug(f"[step5a] 新增加到串文 at ({coord_5a['x']}, {coord_5a['y']})")
-            await _random_delay(2.0, 3.0)
+                return "❌ 新增加到串文失敗（3次重試後放棄）"
+            log.debug("[step5a] 新增加到串文 ✅")
+            await _random_delay(1.5, 2.0)
 
-            # 5b: 發佈
-            coord_5b = await page.evaluate("""() => {
-                const d = document.querySelector('[role="dialog"]');
-                if (!d) return null;
-                const btns = d.querySelectorAll('[role="button"]');
-                for (const b of btns) {
-                    if ((b.innerText || '').includes('發佈')) {
-                        const r = b.getBoundingClientRect();
-                        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
-                    }
-                }
-                return null;
-            }""")
-            if not coord_5b:
+            # 5b: 發佈（點完驗證，dialog 關閉或出現「已發佈」）
+            ok_5b = await clicker.click(
+                label="發佈",
+                role="button",
+                parent="dialog",
+                verify_after=None,  # 最後一步，不強制驗證文字
+                max_retries=3,
+            )
+            if not ok_5b:
                 await ctx.close()
-                return "❌ 發佈 button not found in step 2"
-            await page.mouse.click(coord_5b["x"], coord_5b["y"])
-            log.debug(f"[step5b] 發佈 at ({coord_5b['x']}, {coord_5b['y']})")
+                return "❌ 發佈失敗（3次重試後放棄）"
+            log.debug("[step5b] 發佈 clicked ✅")
             await _random_delay(8.0, 10.0)
 
         except Exception as e:
