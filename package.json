@@ -1,0 +1,23 @@
+{
+  "name": "human-mcp",
+  "version": "1.0.0",
+  "description": "打開瀏覽器搜圖，本地保存，人工選圖後直接上傳。",
+  "main": "scraper.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/whypuss/human-mcp.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/whypuss/human-mcp/issues"
+  },
+  "homepage": "https://github.com/whypuss/human-mcp#readme",
+  "dependencies": {
+    "playwright": "^1.59.1"
+  }
+}

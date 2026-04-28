@@ -68,6 +68,15 @@ Body: {"query": "關鍵詞", "engine": "bing"}
 GET /list
 ```
 
+### 5. CDP Port 追蹤（供其他工具使用）
+
+```
+GET /cdp-port?port=9333   # 寫入並返回 CDP port
+GET /active-cdp-port       # 讀取當前 CDP port
+```
+
+`post_facebook.py` 等工具透過 `~/.cdp_port` 文件讀取當前 active CDP port，復用同一瀏覽器 session。
+
 ## 架構
 
 ```
@@ -78,11 +87,14 @@ Python FastAPI (server.py)          Node.js Playwright (scraper.js)
 AI Agent (Hermes)
        ↓
   /scrape → 本地路徑 → post_ig_human.py → Instagram 發文
+                           ↕
+                    post_facebook.py  → Facebook 發文
 ```
 
-- `server.py` — FastAPI HTTP API（Python）
+- `server.py` — FastAPI HTTP API，含 CDP port 追蹤
 - `scraper.js` — Node.js Playwright 無頭爬蟲
-- `post_ig.js` — Instagram CDP 自動化發文（browser hijack 模式）
+- `post_ig.js` / `post_ig_human.py` — Instagram CDP 自動化發文
+- `post_facebook.py` — Facebook 圖文發文（Playwright CDP 模式）
 
 ## 完整工作流：Google Trends → 圖片 → Caption → IG 發文
 
@@ -103,6 +115,31 @@ result = asyncio.run(post_ig_human(caption, "/path/to/image.jpg"))
 
 詳見：[ai-cdp-browser](https://github.com/whypuss/ai-cdp-browser) — 包含 `post_ig_human.py` + `social_workflow_3source.py`
 
+## 完整工作流：Google Trends → 圖片 → Caption → FB 發文
+
+```python
+# 1. 抓 Google Trends 關鍵字
+# 2. 用 /scrape 自動下載圖片
+# 3. Gemini 生成 caption
+# 4. post_facebook.py 發布到 FB
+
+import asyncio
+from post_facebook import post_facebook
+
+caption = """文章內容... #標籤1 #標籤2"""
+
+result = asyncio.run(post_facebook(caption, "/path/to/image.jpg"))
+# → "✅ Facebook 發文成功"
+```
+
+### Facebook 發文腳本亮點
+
+- **DataTransfer API** — 圖片 base64 → Blob → File → DataTransfer，繞過 React input.files 限制
+- **execCommand("insertText")** — 打字進 contenteditable（React 生態兼容性）
+- **CDP JS innerText 匹配** — 自動點擊「在想什麼」composer、「下一頁」、「發佈」
+- **復用同一瀏覽器 session** — CDP connect_over_cdp，不啟動新瀏覽器
+- **~300 行，無外部依賴** — 只用 playwright.async_api
+
 ## API 總覽
 
 | 方法 | 路徑 | 說明 |
@@ -113,6 +150,8 @@ result = asyncio.run(post_ig_human(caption, "/path/to/image.jpg"))
 | `GET` | `/download` | 下載單張圖片 |
 | `GET` | `/batch-download` | 批量下載 |
 | `GET` | `/list` | 列出已下載圖片 |
+| `GET` | `/cdp-port` | 寫入並返回 CDP port |
+| `GET` | `/active-cdp-port` | 讀取當前 CDP port |
 
 ## 為什麼用 Playwright（Node.js）而不是 Python？
 
