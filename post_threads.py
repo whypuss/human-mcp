@@ -188,10 +188,18 @@ async def post_threads(
                     ).last.click(timeout=3000, force=True)
                     await _random_delay(0.5, 0.8)
 
-                    # 直接 set_input_files，Playwright 用 CDP 繞過 OS dialog
-                    inp = threads_page.locator('[role="dialog"] input[type="file"]').last
-                    await inp.set_input_files(image_path, timeout=5000)
-                    log.debug(f"[step3] Image set: {image_path} ({file_size} bytes)")
+                    # 嘗試攔截 OS file chooser（3s timeout）
+                    # 如果 OS dialog 打開了，set_files() 會讓它自動關閉
+                    # 如果超時（CDP mode），直接用 set_input_files 繞過
+                    try:
+                        fc = await threads_page.context.wait_for_file_chooser(timeout=3000)
+                        await fc.set_files(image_path, timeout=20_000)
+                        log.debug(f"[step3] File via file_chooser: {image_path}")
+                    except Exception as fc_err:
+                        log.warning(f"[step3] file_chooser not intercepted ({fc_err}), using set_input_files")
+                        inp = threads_page.locator('[role="dialog"] input[type="file"]').last
+                        await inp.set_input_files(image_path, timeout=5000)
+                        log.debug(f"[step3] set_input_files succeeded: {image_path}")
 
                     # 等 Threads 上傳完成（blob URL 生成）
                     await asyncio.sleep(8)
