@@ -1,19 +1,17 @@
 """
-post_facebook.py — Facebook 圖文發文（Playwright CDP 模式）
+post_facebook.py — Facebook 圖文發文（Playwright 獨立 Chromium Profile）
 
-學習自 ai-cdp-browser/post_facebook.py 架構：
-- Playwright connect_over_cdp 到 Chromium（復用同一瀏覽器 session）
-- filechooser 事件攔截 → DataTransfer API 注入圖片
-- execCommand("insertText") 打字進 contenteditable
-- CDP JS innerText 匹配點擊按鈕
+用 launch_persistent_context 啟動獨立 Chromium，不影響用戶正常 Chrome。
+第一次需手動登入，之後 profile 自動記住。
 
 流程：
-1. 連接 CDP，找到已登入 FB 頁面
-2. 點「在想什麼」composer
-3. 有圖片：DataTransfer API 注入（base64→Blob→File→DataTransfer）
-4. execCommand("insertText") 輸入文字
-5. 點「下一頁」→ 「發佈」
-6. 等 dialog 消失
+1. 啟動 Chromium（獨立 profile）
+2. 導航到 Facebook 主頁
+3. 點「在想什麼」composer
+4. 有圖片：DataTransfer API 注入
+5. execCommand("insertText") 輸入文字
+6. 點「下一頁」→「發佈」
+7. 等 dialog 消失
 """
 
 import asyncio
@@ -27,18 +25,13 @@ from playwright.async_api import async_playwright
 log = logging.getLogger("post_facebook")
 _random_delay = lambda a, b: asyncio.sleep(random.uniform(a, b))
 
-# 從 server.py 複製而來（human-mcp 無 browser_hijack）
-def _get_active_cdp_port() -> int:
-    """讀取目前 active CDP port。"""
-    try:
-        with open(Path.home() / ".cdp_port", "r") as f:
-            return int(f.read().strip())
-    except Exception:
-        return 9333  # default
+# 獨立 Chromium Profile 目錄（不改變用戶正常 Chrome）
+FB_PROFILE = Path("/tmp/fb-chromium-profile")
+FB_PROFILE.mkdir(parents=True, exist_ok=True)
 
 
 async def _click_btn_by_text(page, text: str, timeout: float = 10):
-    """CDP JS click 按鈕（含 fallback 包含匹配）。"""
+    """JS click 按鈕（含 fallback 包含匹配）。"""
     script = f"""
     () => {{
         var btns = document.querySelectorAll('[role="button"], button');
@@ -57,7 +50,7 @@ async def _click_btn_by_text(page, text: str, timeout: float = 10):
         try:
             r = await page.evaluate(script)
             if r != "not_found":
-                log.debug(f"CDP JS click [{text}]: {r}")
+                log.debug(f"JS click [{text}]: {r}")
                 return r
         except Exception as e:
             log.debug(f"click [{text}] evaluate err: {e}")
@@ -81,21 +74,32 @@ async def _wait_dialog_contains(page, keywords: list, timeout: float = 30) -> bo
     return False
 
 
-async def post_facebook(message: str, image_path: str = None, cdp_port: int = None) -> str:
+async def _ensure_fb_logged_in(page) -> bool:
+    """檢查是否在登入頁，若是則等待手動登入。"""
+    for attempt in range(60):  # 最多等 60 秒
+        await asyncio.sleep(1)
+        try:
+            url = page.url.lower()
+            if "/login" not in url and "facebook.com" in url:
+                log.debug(f"[_ensure] 已登入: {url[:60]}")
+                return True
+            log.debug(f"[_ensure] 等待登入... {attempt+1}/60")
+        except Exception:
+            pass
+    return False
+
+
+async def post_facebook(message: str, image_path: str = None) -> str:
     """
     發布 Facebook 圖文帖子。
 
     Args:
         message: 帖子文字內容
         image_path: 本地圖片路徑（可選）
-        cdp_port: CDP port（預設讀 ~/.cdp_port 或 9333）
 
     Returns:
         "✅ Facebook 發文成功" 或 "❌ 錯誤描述"
     """
-    if cdp_port is None:
-        cdp_port = _get_active_cdp_port()
-
     # ── 參數驗證 ──────────────────────────────────────────────────────────
     if image_path and not os.path.exists(image_path):
         return f"❌ 圖片不存在: {image_path}"
@@ -104,26 +108,28 @@ async def post_facebook(message: str, image_path: str = None, cdp_port: int = No
         return f"❌ 圖片太小（{file_size} bytes），要求 > 1KB"
 
     async with async_playwright() as p:
-        browser = await p.chromium.connect_over_cdp(
-            f"http://localhost:{cdp_port}", timeout=15_000
+        # 啟動獨立 Chromium（用戶正常 Chrome 不受影響）
+        ctx = await p.chromium.launch_persistent_context(
+            str(FB_PROFILE),
+            headless=False,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ],
+            viewport={"width": 1280, "height": 800},
         )
-        ctx = browser.contexts[0]
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
 
-        # ── Step 0: 找到已登入 FB 頁面 ──────────────────────────────────────
-        fb = None
-        for pg in ctx.pages:
-            if "facebook.com/" in pg.url.lower() and "/login" not in pg.url.lower():
-                fb = pg
-                break
-        if not fb:
-            await browser.close()
-            return "❌ 找不到已登入的 Facebook 頁面"
-
-        await fb.bring_to_front()
-        log.debug(f"[fb] Using page: {fb.url[:60]}")
+        # ── Step 0: 確保已登入 ──────────────────────────────────────────────
+        await page.goto("https://www.facebook.com/", timeout=30_000)
+        if not await _ensure_fb_logged_in(page):
+            await ctx.close()
+            return "❌ 登入超時，請手動在 Chromium 視窗中完成登入後重試"
+        log.debug(f"[fb] 已就緒: {page.url[:60]}")
 
         # ── Step 1: 點擊「在想什麼」composer ────────────────────────────────
-        existing = await fb.evaluate(
+        existing = await page.evaluate(
             "() => { var d = document.querySelector('[role=\"dialog\"]'); "
             "return d ? d.innerText.slice(0, 100) : ''; }"
         )
@@ -131,7 +137,7 @@ async def post_facebook(message: str, image_path: str = None, cdp_port: int = No
         if not existing:
             for attempt in range(3):
                 try:
-                    r = await fb.evaluate("""() => {
+                    r = await page.evaluate("""() => {
                         var btn = document.querySelector('[role="button"]');
                         if (btn && btn.innerText.includes('想')) { btn.click(); return 'clicked'; }
                         return 'not_found';
@@ -139,14 +145,14 @@ async def post_facebook(message: str, image_path: str = None, cdp_port: int = No
                     log.debug(f"[step1] composer clicked: {r}")
                     await asyncio.sleep(2)
                     if await _wait_dialog_contains(
-                        fb, ["粉絲專頁", "限時動態", "發佈", "相片", "影片"], timeout=5
+                        page, ["粉絲專頁", "限時動態", "發佈", "相片", "影片"], timeout=5
                     ):
                         break
                     log.debug(f"[step1] composer dialog 未出現，重試 {attempt+1}/3")
                 except Exception as e:
                     log.debug(f"[step1] 点 composer attempt {attempt+1}: {e}")
                     if attempt == 2:
-                        await browser.close()
+                        await ctx.close()
                         return f"❌ 點 composer 失敗: {e}"
                 await asyncio.sleep(2)
 
@@ -155,7 +161,7 @@ async def post_facebook(message: str, image_path: str = None, cdp_port: int = No
             with open(image_path, "rb") as f:
                 b64_data = base64.b64encode(f.read()).decode()
 
-            inject_r = await fb.evaluate("""(b64) => {
+            inject_r = await page.evaluate("""(b64) => {
                 try {
                     const binaryString = atob(b64);
                     const bytes = new Uint8Array(binaryString.length);
@@ -187,15 +193,15 @@ async def post_facebook(message: str, image_path: str = None, cdp_port: int = No
             }""", b64_data)
 
             if not inject_r or not inject_r.get("ok"):
-                await browser.close()
+                await ctx.close()
                 return f"❌ 圖片注入失敗: {inject_r}"
 
             log.debug(f"[step2] Image injected: {image_path} ({file_size} bytes)")
 
-            # 等 FB 處理圖片（blob URL 出現 = 成功）
+            # 等 FB 處理圖片
             for _ in range(10):
                 await asyncio.sleep(1)
-                preview = await fb.evaluate("""() => {
+                preview = await page.evaluate("""() => {
                     var d = document.querySelector('[role=dialog]');
                     if (!d) return null;
                     var imgs = d.querySelectorAll('img[src]');
@@ -213,14 +219,14 @@ async def post_facebook(message: str, image_path: str = None, cdp_port: int = No
         else:
             log.debug("[step2] Skip (no image)")
 
-        # ── Step 3: 打字（execCommand insertText）────────────────────────────
+        # ── Step 3: 打字 ───────────────────────────────────────────────────
         for _ in range(5):
             try:
-                r = await fb.evaluate(f"""
+                r = await page.evaluate(f"""
                 () => {{
-                    var d = document.querySelector('[role="dialog"]');
+                    var d = document.querySelector('[role=\"dialog\"]');
                     if (!d) return "no_dialog";
-                    var e = d.querySelector('[contenteditable="true"]');
+                    var e = d.querySelector('[contenteditable=\"true\"]');
                     if (!e) return "no_editor";
                     e.focus();
                     document.execCommand("insertText", false, {repr(message)});
@@ -235,31 +241,31 @@ async def post_facebook(message: str, image_path: str = None, cdp_port: int = No
                 log.debug(f"[step3] 打字 err: {e}")
             await asyncio.sleep(1)
         else:
-            await browser.close()
+            await ctx.close()
             return "❌ 無法輸入文字"
 
         await _random_delay(0.5, 1.0)
 
         # ── Step 4: 下一頁 ─────────────────────────────────────────────────
-        r = await _click_btn_by_text(fb, "下一頁")
+        r = await _click_btn_by_text(page, "下一頁")
         if r == "not_found":
             try:
-                await fb.locator('[aria-label="下一頁"]').click(timeout=5000)
+                await page.locator('[aria-label="下一頁"]').click(timeout=5000)
                 log.debug("[step4] 下一頁 clicked (aria-label)")
             except Exception:
-                await browser.close()
+                await ctx.close()
                 return "❌ 找不到「下一頁」按鈕"
         log.debug("[step4] 下一頁 clicked")
         await asyncio.sleep(3)
 
         # ── Step 5: 發佈 ───────────────────────────────────────────────────
-        r = await _click_btn_by_text(fb, "發佈")
+        r = await _click_btn_by_text(page, "發佈")
         if r == "not_found":
             try:
-                await fb.locator('[aria-label="發佈"]').click(timeout=5000)
+                await page.locator('[aria-label="發佈"]').click(timeout=5000)
                 log.debug("[step5] 發佈 clicked (aria-label)")
             except Exception:
-                await browser.close()
+                await ctx.close()
                 return "❌ 找不到「發佈」按鈕"
         log.debug("[step5] 發佈 clicked")
 
@@ -267,7 +273,7 @@ async def post_facebook(message: str, image_path: str = None, cdp_port: int = No
         for i in range(20):
             await asyncio.sleep(1)
             try:
-                still_open = await fb.evaluate(
+                still_open = await page.evaluate(
                     "() => !!document.querySelector('[role=\"dialog\"]')"
                 )
                 if not still_open:
@@ -276,10 +282,10 @@ async def post_facebook(message: str, image_path: str = None, cdp_port: int = No
             except Exception:
                 pass
         else:
-            await browser.close()
+            await ctx.close()
             return "❌ 發佈超時"
 
-        await browser.close()
+        await ctx.close()
         return "✅ Facebook 發文成功"
 
 
@@ -290,12 +296,11 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG, format="%(message)s")
 
     if len(sys.argv) < 2:
-        print("用法: python post_facebook.py <message> [image_path] [cdp_port]")
+        print("用法: python post_facebook.py <message> [image_path]")
         sys.exit(1)
 
     msg = sys.argv[1]
     img = sys.argv[2] if len(sys.argv) > 2 else None
-    port = int(sys.argv[3]) if len(sys.argv) > 3 else None
 
-    result = asyncio.run(post_facebook(msg, img, port))
+    result = asyncio.run(post_facebook(msg, img))
     print(result)

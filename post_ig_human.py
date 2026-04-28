@@ -1,55 +1,50 @@
 """
-post_ig_human.py — Instagram 擬人發文流程（CDP 版）
+post_ig_human.py — Instagram 擬人發文流程（Playwright 獨立 Chromium Profile）
+
+用 launch_persistent_context 啟動獨立 Chromium，不影響用戶正常 Chrome。
+第一次需手動登入，之後 profile 自動記住。
 
 流程：
-1. 點小屋圖標 → 確保在首頁餒
+1. 啟動 Chromium → 導航到 IG 首頁
 2. 點新貼文（+）按鈕
-3. 等「建立新帖子」dialog → 點「從電腦選擇」
-4. file_chooser.set_files() 注入圖片
-5. 等 3s（IG 處理圖片）
-6. 右上角「下一步」(裁切頁)
-7. 右上角「下一步」(濾鏡頁)
-8. Caption 頁輸入文字
-9. 右上角「分享」
-10. 等「已分享」→「完成」
+3. 等「建立新帖子」dialog → 攔截 OS file chooser
+4. 等 3s（IG 處理圖片）
+5. 右上角「下一步」(裁切頁)
+6. 右上角「下一步」(濾鏡頁)
+7. Caption 頁輸入文字
+8. 右上角「分享」
+9. 等「已共享」→「完成」
 
 按鈕全部用 [aria-label] 定位，隨機延遲模拟人類操作。
 """
 
 import asyncio
+import base64
 import logging
 import os
 import random
-import time
+from pathlib import Path
 from playwright.async_api import async_playwright
-
-from social_mcp.browser_hijack import get_active_cdp_port
 
 log = logging.getLogger(__name__)
 
 _random = lambda a, b: random.uniform(a, b)
 
+IG_PROFILE = Path("/tmp/ig-chromium-profile")
+IG_PROFILE.mkdir(parents=True, exist_ok=True)
+
 
 # ── Dialog 按鈕點擊（用 aria-label）───────────────────────────────────────────
 
 async def _click_btn_in_dialog(page, target: str, timeout: float = 10) -> bool:
-    """
-    在 [role=dialog] 內找按鈕並點擊。
-    策略1: aria-label 匹配
-    策略2: textContent 包含 target
-    策略3: Playwright locator click (React 原生)
-    """
-    # 把 target 的 f-string 替換準備好（避免嵌套替換問題）
     _target = target  # noqa: F841 used in eval
 
     for _ in range(int(timeout * 5)):
-        # ── 策略0: Playwright 原生 .click()（觸發 React 事件）───────────────
+        # 策略0: Playwright locator + has-text
         try:
-            # 用 Playwright locator + has-text 找元素
             locator = page.locator(f'[role="dialog"] :text-is("{target}")').first
             count = await locator.count()
             if count == 0:
-                # fallback: has-text (contains)
                 locator = page.locator(f'[role="dialog"] :text("{target}")').first
                 count = await locator.count()
             if count > 0:
@@ -59,7 +54,7 @@ async def _click_btn_in_dialog(page, target: str, timeout: float = 10) -> bool:
         except Exception as e:
             log.debug(f"[dialog] playwright '{target}': {e}")
 
-        # ── 策略1: aria-label ──────────────────────────────────────────────
+        # 策略1: aria-label
         try:
             r = await page.evaluate(f"""
             () => {{
@@ -86,7 +81,7 @@ async def _click_btn_in_dialog(page, target: str, timeout: float = 10) -> bool:
         except Exception as e:
             log.debug(f"[dialog] aria try '{target}': {e}")
 
-        # ── 策略2: textContent 包含 target ────────────────────────────────
+        # 策略2: textContent 包含 target
         try:
             r2 = await page.evaluate(f"""
             () => {{
@@ -117,7 +112,7 @@ async def _click_btn_in_dialog(page, target: str, timeout: float = 10) -> bool:
         except Exception as e:
             log.debug(f"[dialog] tc try '{target}': {e}")
 
-        # ── 策略3: Playwright 原生 click ─────────────────────────────────
+        # 策略3: Playwright 原生 click
         try:
             btn = page.locator(f'[role="dialog"] button:has-text("{target}")').first
             if await btn.count() > 0:
@@ -133,7 +128,6 @@ async def _click_btn_in_dialog(page, target: str, timeout: float = 10) -> bool:
 
 
 async def _wait_dialog_contains(page, keyword: str, timeout: float = 20) -> bool:
-    """等 dialog 的 innerText 包含關鍵字。"""
     for _ in range(int(timeout * 5)):
         try:
             dt = await page.evaluate(
@@ -148,37 +142,9 @@ async def _wait_dialog_contains(page, keyword: str, timeout: float = 20) -> bool
     return False
 
 
-# ── 找 nav 圖標（href=# 的 <a>）────────────────────────────────────────────
-
-async def _click_nav_by_aria(page, aria_label: str) -> bool:
-    """點擊導航欄上 aria-label 匹配的 <a> 標籤。"""
-    script = f"""
-    () => {{
-        var anchors = document.querySelectorAll('a[href="#"]');
-        for (var i = 0; i < anchors.length; i++) {{
-            var svg = anchors[i].querySelector('svg');
-            var label = svg ? (svg.getAttribute('aria-label') || '') : '';
-            if (label === '{aria_label}') {{
-                anchors[i].click();
-                return 'clicked';
-            }}
-        }}
-        return 'not_found';
-    }}
-    """
-    try:
-        r = await page.evaluate(script)
-        log.debug(f"[nav] clicked '{aria_label}': {r}")
-        return r == "clicked"
-    except Exception as e:
-        log.warning(f"[nav] click '{aria_label}' failed: {e}")
-        return False
-
-
-# ── 等 IG 首頁 ready（帖子動態可見）──────────────────────────────────────────
+# ── 等 IG 首頁 ready ───────────────────────────────────────────────────────
 
 async def _wait_ig_feed(page, timeout: float = 10) -> bool:
-    """等 IG 首頁 feed 帖子出現（[role='article']）。"""
     for _ in range(int(timeout * 5)):
         try:
             count = await page.evaluate(
@@ -193,46 +159,22 @@ async def _wait_ig_feed(page, timeout: float = 10) -> bool:
     return False
 
 
-# ── CDP 注入文件到 input[type=file] ─────────────────────────────────────────
+# ── 登入等待 ────────────────────────────────────────────────────────────────
 
-async def _inject_file_cdp(page, image_path: str) -> bool:
-    """
-    用 Playwright 的 set_input_files 直接注入文件到 hidden input[type=file]。
-    繞過 OS 文件對話框。
-    """
-    escaped_path = image_path.replace("\\", "\\\\").replace('"', '\\"')
-    result = await page.evaluate(f"""
-    async () => {{
-        const d = document.querySelector('[role="dialog"]');
-        if (!d) return 'no_dialog';
-        const fileInput = d.querySelector('input[type=file]');
-        if (!fileInput) return 'no_file_input';
-
-        // IG React 監聽 'change' 事件
-        // 直接調用 Playwright 的 CDP 來 set_input_files
-        return 'need_playwright_set';
-    }}
-    """)
-    log.debug(f"[inject] CDP result: {result}")
-
-    if result == "need_playwright_set":
-        # 找到 input[type=file]
-        locator = page.locator('[role="dialog"] input[type="file"]').first
+async def _ensure_ig_logged_in(page) -> bool:
+    """等待 IG 頁面加載完成（檢查是否在登入頁）。"""
+    for attempt in range(30):
+        await asyncio.sleep(1)
         try:
-            await locator.set_input_files(image_path, timeout=15_000)
-            log.debug(f"[inject] set_input_files succeeded")
-            await asyncio.sleep(1.5)
-            # 手動觸發 change 事件
-            await page.evaluate("""
-            () => {
-                const d = document.querySelector('[role="dialog"]');
-                const fileInput = d ? d.querySelector('input[type=file]') : null;
-                if (fileInput) fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-            }
-            """)
-            return True
-        except Exception as e:
-            log.warning(f"[inject] set_input_files failed: {e}")
+            url = page.url.lower()
+            if "instagram.com" in url:
+                if "/accounts/login" in url or "/accounts/login/" in url:
+                    log.debug(f"[_ensure] 等待登入... {attempt+1}/30")
+                    continue
+                log.debug(f"[_ensure] 已就緒: {url[:60]}")
+                return True
+        except Exception:
+            pass
     return False
 
 
@@ -246,38 +188,36 @@ async def post_ig_human(caption: str, image_path: str) -> str:
     if file_size < 1024:
         return f"❌ 圖片太小（{file_size} bytes），IG 要求 > 1KB"
 
-    port = get_active_cdp_port()
     async with async_playwright() as p:
-        browser = await p.chromium.connect_over_cdp(
-            f"http://localhost:{port}", timeout=15_000
+        # 啟動獨立 Chromium
+        ctx = await p.chromium.launch_persistent_context(
+            str(IG_PROFILE),
+            headless=False,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ],
+            viewport={"width": 1280, "height": 800},
         )
-        ctx = browser.contexts[0]
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
 
-        # 找到 IG 頁面
-        ig = None
-        for pg in ctx.pages:
-            if "instagram.com/" in pg.url.lower() and "/login" not in pg.url.lower():
-                ig = pg
-                break
-        if not ig:
-            await browser.close()
-            return "❌ 找不到已登入的 Instagram 頁面"
-
-        await ig.bring_to_front()
-
-        # ── Step 0: 確保在首頁 ──────────────────────────────────────────────
-        await ig.goto("https://www.instagram.com/", wait_until="domcontentloaded")
+        # ── Step 0: 確保已登入 ──────────────────────────────────────────────
+        await page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=30_000)
+        if not await _ensure_ig_logged_in(page):
+            await ctx.close()
+            return "❌ IG 登入超時，請在 Chromium 視窗中完成登入後重試"
         await asyncio.sleep(_random(1.5, 2.5))
 
         # 如果有殘留 dialog，關掉
         try:
-            dt = await ig.evaluate(
+            dt = await page.evaluate(
                 "() => { var d = document.querySelector('[role=\"dialog\"]'); "
                 "return d ? d.innerText.slice(0, 100) : ''; }"
             )
             if dt:
                 log.debug(f"Closing residual dialog: {repr(dt[:50])}")
-                await ig.keyboard.press("Escape")
+                await page.keyboard.press("Escape")
                 await asyncio.sleep(1.2)
         except Exception:
             pass
@@ -287,7 +227,7 @@ async def post_ig_human(caption: str, image_path: str) -> str:
 
         for attempt in range(3):
             try:
-                await ig.evaluate("""
+                await page.evaluate("""
                 () => {
                     var s = document.querySelector('svg[aria-label="新貼文"]');
                     if (s && s.parentElement && s.parentElement.tagName === 'A') {
@@ -303,74 +243,103 @@ async def post_ig_human(caption: str, image_path: str) -> str:
             except Exception as e:
                 log.warning(f"[step1] attempt {attempt + 1} failed: {e}")
                 if attempt == 2:
-                    await browser.close()
+                    await ctx.close()
                     return f"❌ 點新貼文失敗: {e}"
                 await asyncio.sleep(2)
 
         # ── Step 2: 等「建立新帖子」dialog，注入圖片 ──────────────────────────
-        if not await _wait_dialog_contains(ig, "從電腦選擇", timeout=15):
+        if not await _wait_dialog_contains(page, "從電腦選擇", timeout=15):
             await asyncio.sleep(2)
-            dt = await ig.evaluate(
+            dt = await page.evaluate(
                 "() => { var d = document.querySelector('[role=\"dialog\"]'); "
                 "return d ? d.innerText.slice(0, 100) : ''; }"
             )
             if "從電腦選擇" not in dt:
-                await browser.close()
+                await ctx.close()
                 return "❌ 建立新帖子 dialog 未出現"
 
-        log.debug("[step2] Injecting image via set_input_files (CDP)")
+        log.debug("[step2] Waiting for file chooser...")
         await asyncio.sleep(_random(0.5, 1.0))
 
-        # 方案：用 context.expect_file_chooser() 等 dialog 出現
-        # 如果超時（dialog 沒出現），直接用 set_input_files 注入
+        # 方案：優先攔截 OS file_chooser，失敗則用 JS DataTransfer
+        file_injected = False
         try:
-            fc = await ig.context.wait_for_file_chooser(timeout=3000)
-            log.debug(f"[step2] file_chooser intercepted: {fc}")
+            fc = await ctx.wait_for_file_chooser(timeout=3000)
             await fc.set_files(image_path, timeout=20_000)
             log.debug(f"[step2] File set via file_chooser: {image_path}")
+            file_injected = True
         except Exception as fc_err:
-            # file_chooser 沒出現，用 set_input_files 直接注入（不走 OS dialog）
-            log.warning(f"[step2] file_chooser not intercepted ({fc_err}), using set_input_files")
+            # OS file chooser 沒出現，用 JS DataTransfer 直接注入
+            log.warning(f"[step2] file_chooser not intercepted ({fc_err}), using JS DataTransfer")
+            with open(image_path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
             try:
-                inp = ig.locator('[role="dialog"] input[type="file"]').first
-                await inp.set_input_files(image_path, timeout=15_000)
-                log.debug(f"[step2] set_input_files succeeded: {image_path}")
-                # 手動觸發 change 事件
-                await ig.evaluate("""
-                () => {
-                    const d = document.querySelector('[role="dialog"]');
-                    const fileInput = d ? d.querySelector('input[type=file]') : null;
-                    if (fileInput) fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-                }
-                """)
+                result = await page.evaluate("""(b64) => {
+                    try {
+                        const binaryString = atob(b64);
+                        const bytes = new Uint8Array(binaryString.length);
+                        for (let i = 0; i < binaryString.length; i++) {
+                            bytes[i] = binaryString.charCodeAt(i);
+                        }
+                        const blob = new Blob([bytes], { type: 'image/jpeg' });
+                        const file = new File([blob], 'upload.jpg', { type: 'image/jpeg', lastModified: Date.now() });
+
+                        const d = document.querySelector('[role="dialog"]');
+                        if (!d) return 'no_dialog';
+                        const inputs = d.querySelectorAll('input[type=file]');
+                        if (!inputs.length) return 'no_file_input';
+
+                        const inp = inputs[0];
+                        const dt = new DataTransfer();
+                        dt.items.add(file);
+                        Object.defineProperty(inp, 'files', {
+                            value: dt.files,
+                            writable: true,
+                            configurable: true
+                        });
+                        const tracker = inp._valueTracker;
+                        if (tracker) tracker.setValue('');
+                        inp.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                        inp.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                        return { ok: true, files: dt.files.length };
+                    } catch(e) {
+                        return { error: e.message };
+                    }
+                }""", b64)
+                log.debug(f"[step2] JS DataTransfer result: {result}")
+                if not result.get("ok"):
+                    raise Exception(f"JS inject failed: {result}")
+                file_injected = True
             except Exception as inject_err:
-                log.error(f"[step2] set_input_files also failed: {inject_err}")
-                await ig.keyboard.press("Escape")  # 清理殘留 dialog
+                log.error(f"[step2] JS DataTransfer failed: {inject_err}")
+                await page.keyboard.press("Escape")
                 raise Exception(f"Image upload failed: {inject_err}")
+
+        if not file_injected:
+            raise Exception("Image injection failed (no method available)")
 
         # IG 處理圖片
         await asyncio.sleep(_random(3.0, 3.5))
         log.debug("[step2] Image processing...")
 
         # ── Step 3: 右上角「下一步」(裁切/調整) ──────────────────────────────
-        if not await _click_btn_in_dialog(ig, "下一步", timeout=8):
-            await browser.close()
+        if not await _click_btn_in_dialog(page, "下一步", timeout=8):
+            await ctx.close()
             return "❌ 裁切頁「下一步」找不到"
         log.debug("[step3] Crop page → 下一步 clicked")
         await asyncio.sleep(_random(1.5, 2.0))
 
         # ── Step 4: 右上角「下一步」(濾鏡) ─────────────────────────────────
-        if not await _click_btn_in_dialog(ig, "下一步", timeout=8):
-            await browser.close()
+        if not await _click_btn_in_dialog(page, "下一步", timeout=8):
+            await ctx.close()
             return "❌ 濾鏡頁「下一步」找不到"
         log.debug("[step4] Filter page → 下一步 clicked")
         await asyncio.sleep(_random(2.0, 2.5))
 
         # ── Step 5: Caption 頁 ───────────────────────────────────────────────
-        # 等說明文字出現（最多 15 秒，不斷重試）
         caption_found = False
         for _ in range(30):
-            dt = await ig.evaluate(
+            dt = await page.evaluate(
                 "() => { var d = document.querySelector('[role=\"dialog\"]'); "
                 "return d ? d.innerText.slice(0, 300) : ''; }"
             )
@@ -379,16 +348,15 @@ async def post_ig_human(caption: str, image_path: str) -> str:
                 log.debug(f"[step5] Caption page detected: {repr(dt[:80])}")
                 break
             if "裁切" in dt and _ > 3:
-                # 仍在裁切頁，再點一次下一步
                 log.debug(f"[step5] Still on crop page, retrying 下一步...")
-                await _click_btn_in_dialog(ig, "下一步", timeout=5)
+                await _click_btn_in_dialog(page, "下一步", timeout=5)
                 await asyncio.sleep(1.5)
             await asyncio.sleep(0.5)
 
         if not caption_found:
-            await browser.close()
+            await ctx.close()
             try:
-                dt = await ig.evaluate(
+                dt = await page.evaluate(
                     "() => { var d = document.querySelector('[role=\"dialog\"]'); "
                     "return d ? d.innerText.slice(0, 200) : ''; }"
                 )
@@ -396,10 +364,10 @@ async def post_ig_human(caption: str, image_path: str) -> str:
                 dt = ""
             return f"❌ 輸入說明文字頁未出現: {repr(dt[:80])}"
 
-        # 找 caption textbox（contenteditable div）
+        # 找 caption textbox
         for _ in range(10):
             try:
-                boxes = ig.locator('[role="dialog"] [role="textbox"]')
+                boxes = page.locator('[role="dialog"] [role="textbox"]')
                 if await boxes.count() > 0:
                     await boxes.first.click(timeout=2000, force=True)
                     log.debug("[step5] Caption textbox clicked")
@@ -409,22 +377,22 @@ async def post_ig_human(caption: str, image_path: str) -> str:
                 log.debug(f"[step5] textbox attempt err: {e}")
             await asyncio.sleep(_random(0.3, 0.5))
         else:
-            await browser.close()
+            await ctx.close()
             return "❌ 找不到 caption textbox"
 
         # 輸入 caption
-        textbox = ig.locator('[role="dialog"] [role="textbox"]').first
+        textbox = page.locator('[role="dialog"] [role="textbox"]').first
         await textbox.fill(caption)
         log.debug(f"[step5] Caption filled: {len(caption)} chars")
         await asyncio.sleep(_random(1.0, 1.5))
 
-        # 模擬人類打字後的光標操作（觸發 React onChange）
-        await ig.keyboard.press("ArrowRight")
+        # 模擬人類打字後的光標操作
+        await page.keyboard.press("ArrowRight")
         await asyncio.sleep(_random(0.3, 0.5))
 
         # ── Step 6: 右上角「分享」────────────────────────────────────────────
-        if not await _click_btn_in_dialog(ig, "分享", timeout=8):
-            await browser.close()
+        if not await _click_btn_in_dialog(page, "分享", timeout=8):
+            await ctx.close()
             return "❌ 找不到「分享」按鈕"
         log.debug("[step6] 分享 clicked")
         await asyncio.sleep(_random(1.0, 1.5))
@@ -433,7 +401,7 @@ async def post_ig_human(caption: str, image_path: str) -> str:
         for i in range(50):
             await asyncio.sleep(1)
             try:
-                dt = await ig.evaluate(
+                dt = await page.evaluate(
                     "() => { var d = document.querySelector('[role=\"dialog\"]'); "
                     "return d ? d.innerText.slice(0, 200) : ''; }"
                 )
@@ -441,14 +409,14 @@ async def post_ig_human(caption: str, image_path: str) -> str:
                     log.debug(f"[step7] ✅ 已分享（{i + 1}s）")
                     break
                 if "發生錯誤" in dt or "錯誤" in dt:
-                    await browser.close()
+                    await ctx.close()
                     return f"❌ IG 發文錯誤: {repr(dt[:80])}"
             except Exception:
                 pass
         else:
-            await browser.close()
+            await ctx.close()
             try:
-                dt = await ig.evaluate(
+                dt = await page.evaluate(
                     "() => (document.querySelector('[role=\"dialog\"]')||{}).innerText||''"
                 )
                 return f"❌ 分享超時，dialog: {repr(dt[:80])}"
@@ -458,15 +426,15 @@ async def post_ig_human(caption: str, image_path: str) -> str:
         await asyncio.sleep(_random(0.5, 1.0))
 
         # 點「完成」或按 Escape
-        found_done = await _click_btn_in_dialog(ig, "完成", timeout=5)
+        found_done = await _click_btn_in_dialog(page, "完成", timeout=5)
         if not found_done:
             log.debug("[step7] 完成 not found, pressing Escape")
-            await ig.keyboard.press("Escape")
+            await page.keyboard.press("Escape")
         else:
             log.debug("[step7] 完成 clicked")
 
         await asyncio.sleep(1)
-        await browser.close()
+        await ctx.close()
         return "✅ Instagram 發文成功"
 
 
@@ -478,7 +446,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG, format="%(message)s")
 
     if len(sys.argv) < 3:
-        print("用法: python -m social_mcp.post_ig_human <caption> <image_path>")
+        print("用法: python post_ig_human.py <caption> <image_path>")
         sys.exit(1)
 
     result = asyncio.run(post_ig_human(sys.argv[1], sys.argv[2]))
