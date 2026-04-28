@@ -2,7 +2,7 @@
 
 **AI Agent 全自動圖片搜尋 + 社群發文工具。**
 
-從 Google Trends 抓關鍵字 → Playwright 無頭下載圖片 → AI 生成 caption → 自動發布到 Facebook/Instagram。全流程無需人工干預。
+從 Google Trends 抓關鍵字 → Playwright 無頭下載圖片 → AI 生成 caption → 自動發布到 Facebook/Threads。全流程無需人工干預。
 
 ## 解決問題
 
@@ -80,9 +80,8 @@ human-mcp /scrape (自動下載圖片)
        ↓
 AI 生成 caption (本地 LLM)
        ↓
-post_facebook.py (CDP 自動發文)
-       ↓
-Facebook 發文成功 ✅
+post_facebook.py ──→ Facebook 發文 ✅
+post_threads.py ──→ Threads 發文 ✅
 ```
 
 ```
@@ -93,15 +92,15 @@ Python FastAPI (server.py)          Node.js Playwright (scraper.js)
 AI Agent (Hermes)
        ↓
   /scrape → 本地路徑 → post_facebook.py → Facebook 發文
-                           post_ig_human.py → Instagram 發文
+                           post_threads.py → Threads 發文
 ```
 
 - `server.py` — FastAPI HTTP API，含 CDP port 追蹤
 - `scraper.js` — Node.js Playwright 無頭爬蟲
-- `post_ig_human.py` — Instagram CDP 自動化發文
 - `post_facebook.py` — Facebook 圖文發文（~300 行，純 Playwright CDP）
+- `post_threads.py` — Threads 圖文發文（~380 行，純 Playwright CDP）
 
-## 完整工作流：Google Trends → 圖片 → Caption → FB 發文
+## 完整工作流：Google Trends → 圖片 → Caption → FB/Threads 發文
 
 ```bash
 # Step 1: 抓 Google Trends 關鍵字（browser_navigate）
@@ -111,9 +110,13 @@ curl "http://localhost:8080/scrape?query=jimmy+kimmel+melania+trump&engine=bing&
 
 # Step 3: AI 生成 caption（用本地 LLM）
 
-# Step 4: post_facebook.py 發布
+# Step 4a: post_facebook.py 發布
 python3 post_facebook.py "Caption 文字..." "/path/to/image.jpg" 9333
 # → ✅ Facebook 發文成功
+
+# Step 4b: post_threads.py 發布（需先開啟 Threads tab）
+python3 post_threads.py "Caption 文字..." "/path/to/image.jpg" 9333
+# → ✅ Threads 發文成功
 ```
 
 ## Facebook 發文腳本亮點
@@ -123,6 +126,15 @@ python3 post_facebook.py "Caption 文字..." "/path/to/image.jpg" 9333
 - **CDP JS innerText 匹配** — 自動點擊「在想什麼」composer、「下一頁」、「發佈」
 - **復用同一瀏覽器 session** — CDP connect_over_cdp，不啟動新瀏覽器
 - **~300 行，無外部依賴** — 只用 playwright.async_api
+
+## Threads 發文腳本亮點
+
+- **兩步發文流程**：「新增到串文」→「發佈」，Threads API 特性
+- **set_input_files()** — Playwright 直接設檔案，繞過 OS dialog
+- **keyboard.type()** — 擬人打字速度（40-80ms/字），避免被判定機器人
+- **座標點擊** — getBoundingClientRect → mouse.click，避免 Playwright locator 不穩定
+- **reload 驗證** — 發佈後 reload 頁面確認內容存在
+- **~380 行，無外部依賴** — 只用 playwright.async_api
 
 ## API 總覽
 
